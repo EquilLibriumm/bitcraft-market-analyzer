@@ -144,10 +144,11 @@ class BitjitaClient:
         self._cache_timestamp[cache_key] = time.time()
         logger.info(f"Cached {len(data)} orders for {region_name}")
     
-    def get_market_data(self, region_name: str, item_name: Optional[str] = None, use_cache: bool = True) -> List[Dict]:
+    def get_market_data(self, region_name: str, item_name: Optional[str] = None, use_cache: bool = True, progress_callback=None) -> List[Dict]:
         """
         Fetch market listings for a region, optionally filtered by item name
         Uses cache if available and recent
+        progress_callback: optional function to report progress (item_num, total_items)
         """
         # Check cache first
         if use_cache and not item_name:  # Only use cache for full region scans
@@ -212,6 +213,10 @@ class BitjitaClient:
                 item_id = str(item.get('id', ''))
                 item_name_api = item.get('name', 'Unknown Item')
                 
+                # Report progress
+                if progress_callback:
+                    progress_callback(idx + 1, len(items_to_process))
+                
                 try:
                     detail_params = {}
                     if region_num:
@@ -247,13 +252,22 @@ class BitjitaClient:
                         quantity = int(order.get('quantity', 0))
                         
                         if price > 0 and quantity > 0:
+                            order_detail = {
+                                'claim_name': order.get('claimName', 'Unknown'),
+                                'owner': order.get('ownerUsername', 'Unknown'),
+                                'price': price,
+                                'quantity': quantity,
+                                'region_name': order.get('regionName', region_name)
+                            }
                             all_orders.append({
                                 'item_id': item_id,
                                 'name': item_name_api,
                                 'price': price,
                                 'volume': quantity,
                                 'region': order.get('regionName', region_name),
-                                'order_type': 'sell'
+                                'order_type': 'sell',
+                                'claim_name': order.get('claimName', 'Unknown'),
+                                'owner': order.get('ownerUsername', 'Unknown')
                             })
                     
                     # Process buy orders
@@ -272,16 +286,15 @@ class BitjitaClient:
                                 'price': price,
                                 'volume': quantity,
                                 'region': order.get('regionName', region_name),
-                                'order_type': 'buy'
+                                'order_type': 'buy',
+                                'claim_name': order.get('claimName', 'Unknown'),
+                                'owner': order.get('ownerUsername', 'Unknown')
                             })
                     
                     if (idx + 1) % 100 == 0:
                         logger.info(f"Processed {idx + 1}/{len(items_to_process)} items, found {len(all_orders)} orders")
-                        # Emit progress percentage
-                        progress_pct = int((idx + 1) / len(items_to_process) * 100)
-                        self.signals.progress_percent.emit(progress_pct)
                     
-                    time.sleep(0.02)  # Reduced from 0.05 for faster processing
+                    time.sleep(0.01)  # Reduced to 0.01 for even faster processing
                     
                 except Exception as e:
                     logger.debug(f"Error processing item {item_id}: {e}")
@@ -346,13 +359,16 @@ class DataProcessor:
         """
         Group by item_id and calculate metrics with outlier removal
         order_filter: 'both', 'sell', or 'buy'
+        Also stores detailed order information per claim
         """
         aggregated = defaultdict(lambda: {
             'name': '',
             'sell_prices': [],
             'sell_volumes': [],
             'buy_prices': [],
-            'buy_volumes': []
+            'buy_volumes': [],
+            'sell_details': [],  # Store detailed sell orders
+            'buy_details': []    # Store detailed buy orders
         })
         
         for item in items:
@@ -362,6 +378,7 @@ class DataProcessor:
             if item.order_type == 'sell':
                 agg['sell_prices'].append(item.price)
                 agg['sell_volumes'].append(item.volume)
+                # Store details: we'll get this from raw data
             elif item.order_type == 'buy':
                 agg['buy_prices'].append(item.price)
                 agg['buy_volumes'].append(item.volume)
@@ -398,7 +415,9 @@ class DataProcessor:
                 'avg_price': avg_price,
                 'value_score': value_score,
                 'sell_orders': len(data['sell_prices']),
-                'buy_orders': len(data['buy_prices'])
+                'buy_orders': len(data['buy_prices']),
+                'sell_details': data['sell_details'],
+                'buy_details': data['buy_details']
             }
         
         logger_proc.info(f"Aggregated {len(result)} unique items (filter: {order_filter})")
@@ -473,17 +492,32 @@ class MarketDataWorker(QRunnable):
             self.signals.progress.emit(f"Fetching data for {self.region}...")
             self.signals.progress_percent.emit(0)
             
-            raw_data = self.client.get_market_data(self.region, self.item_name)
+            # Progress callback for API fetching
+            def update_fetch_progress(current, total):
+                if total > 0:
+                    # Map to 10-80% range for API fetching
+                    pct = int(10 + (current / total * 70))
+                    self.signals.progress_percent.emit(pct)
+                    if current % 50 == 0:  # Update message every 50 items
+                        self.signals.progress.emit(f"Processing item {current}/{total}...")
+            
+            raw_data = self.client.get_market_data(
+                self.region, 
+                self.item_name,
+                progress_callback=update_fetch_progress
+            )
             
             if not raw_data:
                 self.signals.progress_percent.emit(0)
                 self.signals.error.emit("No data returned from API")
                 return
             
-            self.signals.progress.emit(f"Processing {len(raw_data)} orders...")
-            self.signals.progress_percent.emit(10)
+            self.signals.progress.emit(f"Aggregating {len(raw_data)} orders...")
+            self.signals.progress_percent.emit(85)
             
             items = []
+            raw_orders_by_item = defaultdict(list)  # Store raw orders grouped by item
+            
             for entry in raw_data:
                 try:
                     # Handle both cached format and API format
@@ -497,6 +531,8 @@ class MarketDataWorker(QRunnable):
                     )
                     if item.price > 0 and item.volume > 0:
                         items.append(item)
+                        # Store raw order data for details
+                        raw_orders_by_item[item.item_id].append(entry)
                 except (ValueError, KeyError, TypeError) as e:
                     logger.debug(f"Skipping invalid entry: {e}")
                     continue
@@ -506,8 +542,8 @@ class MarketDataWorker(QRunnable):
                 self.signals.error.emit("No valid market data found")
                 return
             
-            self.signals.progress.emit(f"Aggregating {len(items)} valid orders...")
-            self.signals.progress_percent.emit(80)
+            self.signals.progress.emit(f"Analyzing {len(items)} valid orders...")
+            self.signals.progress_percent.emit(90)
             
             processor = DataProcessor()
             aggregated = processor.aggregate_items(items, self.order_filter)
@@ -517,11 +553,19 @@ class MarketDataWorker(QRunnable):
                 self.signals.error.emit("No items after aggregation")
                 return
             
-            self.signals.progress.emit(f"Ranking items...")
-            self.signals.progress_percent.emit(90)
+            self.signals.progress.emit(f"Ranking {len(aggregated)} items...")
+            self.signals.progress_percent.emit(95)
             
             analyzer = MarketAnalyzer()
             all_results = analyzer.find_best_deals(aggregated, self.min_volume)
+            
+            # Add detailed order information to each result
+            for result in all_results:
+                item_id = result['item_id']
+                if item_id in raw_orders_by_item:
+                    result['order_details'] = raw_orders_by_item[item_id]
+                else:
+                    result['order_details'] = []
             
             if not all_results:
                 self.signals.progress_percent.emit(0)
@@ -532,12 +576,13 @@ class MarketDataWorker(QRunnable):
             results = all_results[:self.max_results]
             
             logger.info(f"Worker finished - emitting {len(results)} results")
-            if results:
-                logger.info(f"First result structure: {results[0]}")
+            logger.info(f"About to emit finished signal...")
             
             self.signals.progress_percent.emit(100)
             self.signals.progress.emit(f"Showing top {len(results)} of {len(all_results)} items")
             self.signals.finished.emit(results)
+            
+            logger.info("Finished signal emitted successfully")
             
         except Exception as e:
             logger.error(f"Worker error: {e}", exc_info=True)
@@ -552,19 +597,43 @@ from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
 from typing import List, Dict, Any
 
 class MarketTableModel(QAbstractTableModel):
-    """Table model for displaying market analysis results"""
+    """Table model for displaying market analysis results with expandable details"""
     
     HEADERS = ['Item Name', 'Total Volume', 'Average Price', 'Value Score', 'Sell Orders', 'Buy Orders']
     
     def __init__(self):
         super().__init__()
         self._data: List[Dict] = []
+        self._expanded_rows = set()  # Track which rows are expanded
     
     def rowCount(self, parent=QModelIndex()) -> int:
-        return len(self._data)
+        count = 0
+        for idx, item in enumerate(self._data):
+            count += 1  # Main row
+            if idx in self._expanded_rows:
+                # Add detail rows
+                count += len(item.get('order_details', []))
+        return count
     
     def columnCount(self, parent=QModelIndex()) -> int:
         return len(self.HEADERS)
+    
+    def _get_actual_item_and_detail(self, row: int):
+        """Map display row to actual item index and detail index"""
+        current_row = 0
+        for item_idx, item in enumerate(self._data):
+            if current_row == row:
+                return item_idx, -1, item  # Main row
+            current_row += 1
+            
+            if item_idx in self._expanded_rows:
+                detail_count = len(item.get('order_details', []))
+                if current_row + detail_count > row:
+                    detail_idx = row - current_row
+                    return item_idx, detail_idx, item
+                current_row += detail_count
+        
+        return None, None, None
     
     def data(self, index: QModelIndex, role=Qt.DisplayRole) -> Any:
         if not index.isValid():
@@ -573,25 +642,57 @@ class MarketTableModel(QAbstractTableModel):
         row = index.row()
         col = index.column()
         
-        if row >= len(self._data):
-            return None
-        
         try:
-            item = self._data[row]
+            item_idx, detail_idx, item = self._get_actual_item_and_detail(row)
+            
+            if item_idx is None:
+                return None
             
             if role == Qt.DisplayRole:
-                if col == 0:
-                    return item.get('name', 'Unknown')
-                elif col == 1:
-                    return f"{item.get('total_volume', 0):,}"
-                elif col == 2:
-                    return f"${item.get('avg_price', 0):.2f}"
-                elif col == 3:
-                    return f"${item.get('value_score', 0):,.2f}"
-                elif col == 4:
-                    return str(item.get('sell_orders', 0))
-                elif col == 5:
-                    return str(item.get('buy_orders', 0))
+                # Main item row
+                if detail_idx == -1:
+                    if col == 0:
+                        prefix = "▼ " if item_idx in self._expanded_rows else "▶ "
+                        return prefix + item.get('name', 'Unknown')
+                    elif col == 1:
+                        return f"{item.get('total_volume', 0):,}"
+                    elif col == 2:
+                        return f"${item.get('avg_price', 0):.2f}"
+                    elif col == 3:
+                        return f"${item.get('value_score', 0):,.2f}"
+                    elif col == 4:
+                        return str(item.get('sell_orders', 0))
+                    elif col == 5:
+                        return str(item.get('buy_orders', 0))
+                # Detail row
+                else:
+                    details = item.get('order_details', [])
+                    if detail_idx < len(details):
+                        order = details[detail_idx]
+                        if col == 0:
+                            claim = order.get('claim_name', 'Unknown')
+                            owner = order.get('owner', 'Unknown')
+                            order_type = order.get('order_type', 'sell').upper()
+                            return f"    [{order_type}] {claim} ({owner})"
+                        elif col == 1:
+                            return f"{order.get('volume', 0):,}"
+                        elif col == 2:
+                            return f"${order.get('price', 0):.2f}"
+                        elif col == 3:
+                            vol = order.get('volume', 0)
+                            price = order.get('price', 0)
+                            return f"${vol * price:,.2f}"
+                        elif col == 4 or col == 5:
+                            return ""
+            
+            elif role == Qt.FontRole:
+                if detail_idx >= 0:
+                    # Detail rows use smaller font
+                    from PySide6.QtGui import QFont
+                    font = QFont()
+                    font.setPointSize(9)
+                    return font
+                    
         except Exception as e:
             logger = setup_logger('table_model')
             logger.error(f"Error rendering cell [{row},{col}]: {e}", exc_info=True)
@@ -607,12 +708,33 @@ class MarketTableModel(QAbstractTableModel):
     def update_data(self, new_data: List[Dict]):
         """Update table with new data"""
         try:
+            logger = setup_logger('table_model')
+            logger.info(f"update_data called with {len(new_data)} items")
+            
             self.beginResetModel()
             self._data = new_data if new_data else []
+            self._expanded_rows.clear()  # Clear expansions on new data
             self.endResetModel()
+            
+            logger.info(f"Table reset complete. rowCount={self.rowCount()}, data items={len(self._data)}")
         except Exception as e:
             logger = setup_logger('table_model')
             logger.error(f"Error updating table data: {e}", exc_info=True)
+    
+    def toggle_expand(self, row: int):
+        """Toggle expansion of a row"""
+        item_idx, detail_idx, item = self._get_actual_item_and_detail(row)
+        
+        # Only toggle if clicking on main row
+        if item_idx is not None and detail_idx == -1:
+            if item_idx in self._expanded_rows:
+                self._expanded_rows.remove(item_idx)
+            else:
+                self._expanded_rows.add(item_idx)
+            
+            # Refresh the view
+            self.beginResetModel()
+            self.endResetModel()
     
     def sort(self, column: int, order: Qt.SortOrder):
         """Sort table by column"""
@@ -660,12 +782,16 @@ class MarketController:
         self.status_callback("Loading...")
         
         worker = MarketDataWorker(self.client, region, min_volume, max_results, order_filter, item_name)
+        
+        logger_ctrl.info("Connecting worker signals...")
         worker.signals.finished.connect(self._on_data_ready)
         worker.signals.error.connect(self._on_error)
         worker.signals.progress.connect(self.status_callback)
         worker.signals.progress_percent.connect(self._on_progress_update)
         
+        logger_ctrl.info("Starting worker thread...")
         self.thread_pool.start(worker)
+        logger_ctrl.info("Worker thread started")
     
     def _on_progress_update(self, percent: int):
         """Handle progress updates"""
@@ -678,12 +804,13 @@ class MarketController:
             logger_ctrl.info(f"Controller received {len(results)} results")
             if results:
                 logger_ctrl.info(f"First result keys: {list(results[0].keys())}")
-                logger_ctrl.info(f"First result values: {results[0]}")
+                logger_ctrl.info(f"First result has {len(results[0].get('order_details', []))} order details")
             else:
                 logger_ctrl.warning("Results list is empty!")
             
+            logger_ctrl.info(f"Calling table_model.update_data with {len(results)} items")
             self.table_model.update_data(results)
-            logger_ctrl.info("Table model updated successfully")
+            logger_ctrl.info(f"Table now has {self.table_model.rowCount()} rows")
             self.status_callback(f"Last updated • Showing {len(results)} items")
         except Exception as e:
             logger_ctrl.error(f"Error updating table: {e}", exc_info=True)
@@ -790,9 +917,10 @@ class MainWindow(QMainWindow):
         # Table view
         self.table_view = QTableView()
         self.table_view.setModel(self.table_model)
-        self.table_view.setSortingEnabled(True)
+        self.table_view.setSortingEnabled(False)  # Disable sorting with expandable rows
         self.table_view.setAlternatingRowColors(True)
         self.table_view.horizontalHeader().setStretchLastSection(True)
+        self.table_view.clicked.connect(self._on_table_click)
         
         # Set column widths
         self.table_view.setColumnWidth(0, 250)
@@ -849,6 +977,10 @@ class MainWindow(QMainWindow):
         if not item or item == "All Items":
             item = None
         
+        # Show progress bar
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        
         self.controller.refresh_market_data(region, min_volume, max_results, order_filter, item)
     
     def _on_clear_cache(self):
@@ -858,9 +990,22 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Cache cleared - next refresh will rescan API")
         self._on_refresh()
     
+    def update_progress(self, percent: int):
+        """Update progress bar"""
+        self.progress_bar.setValue(percent)
+        if percent >= 100:
+            # Hide progress bar after a short delay
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(500, lambda: self.progress_bar.setVisible(False))
+    
     def update_status(self, message: str):
         """Update status bar message"""
         self.status_bar.showMessage(message)
+    
+    def _on_table_click(self, index):
+        """Handle table row clicks for expansion"""
+        if index.isValid():
+            self.table_model.toggle_expand(index.row())
 
 # ============================================================================
 # main.py
@@ -880,6 +1025,10 @@ def main():
     window = MainWindow(None, table_model, regions, client)
     
     controller = MarketController(client, table_model, window.update_status)
+    
+    # Connect progress updates to window
+    controller._on_progress_update = window.update_progress
+    
     window.controller = controller
     
     window.show()
