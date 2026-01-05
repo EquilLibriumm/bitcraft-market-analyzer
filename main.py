@@ -334,43 +334,40 @@ class DataProcessor:
         if len(prices) < 3:
             return prices
         
-        # Sort prices
         sorted_prices = sorted(prices)
         
-        # Calculate percentile indices
         low_idx = int(len(sorted_prices) * (OUTLIER_PERCENTILE_LOW / 100))
         high_idx = int(len(sorted_prices) * (OUTLIER_PERCENTILE_HIGH / 100))
         
-        # Ensure we have at least some data
         if high_idx <= low_idx:
             high_idx = low_idx + 1
         
-        # Return middle range
         filtered = sorted_prices[low_idx:high_idx]
         
         if not filtered:
             return prices[:1] if prices else prices
         
-        logger_proc.debug(f"Filtered {len(prices)} prices to {len(filtered)} (removed {len(prices) - len(filtered)} outliers)")
+        logger_proc.debug(
+            f"Filtered {len(prices)} prices to {len(filtered)} "
+            f"(removed {len(prices) - len(filtered)} outliers)"
+        )
         return filtered
     
     @staticmethod
     def aggregate_items(items: List[MarketItem], order_filter: str = 'both') -> Dict:
         """
-        Group by item_id and calculate metrics with outlier removal
+        Group by item_id and calculate metrics with VOLUME-WEIGHTED pricing
         order_filter: 'both', 'sell', or 'buy'
-        Also stores detailed order information per claim
         """
         aggregated = defaultdict(lambda: {
             'name': '',
             'sell_prices': [],
             'sell_volumes': [],
             'buy_prices': [],
-            'buy_volumes': [],
-            'sell_details': [],  # Store detailed sell orders
-            'buy_details': []    # Store detailed buy orders
+            'buy_volumes': []
         })
         
+        # Collect raw prices + volumes
         for item in items:
             agg = aggregated[item.item_id]
             agg['name'] = item.name
@@ -378,35 +375,49 @@ class DataProcessor:
             if item.order_type == 'sell':
                 agg['sell_prices'].append(item.price)
                 agg['sell_volumes'].append(item.volume)
-                # Store details: we'll get this from raw data
             elif item.order_type == 'buy':
                 agg['buy_prices'].append(item.price)
                 agg['buy_volumes'].append(item.volume)
         
         result = {}
+        
         for item_id, data in aggregated.items():
-            # Filter based on order type
-            prices_to_use = []
-            volumes_to_use = []
+            prices = []
+            volumes = []
             
             if order_filter == 'sell':
-                prices_to_use = data['sell_prices']
-                volumes_to_use = data['sell_volumes']
+                prices = data['sell_prices']
+                volumes = data['sell_volumes']
             elif order_filter == 'buy':
-                prices_to_use = data['buy_prices']
-                volumes_to_use = data['buy_volumes']
-            else:  # 'both'
-                prices_to_use = data['sell_prices'] + data['buy_prices']
-                volumes_to_use = data['sell_volumes'] + data['buy_volumes']
+                prices = data['buy_prices']
+                volumes = data['buy_volumes']
+            else:
+                prices = data['sell_prices'] + data['buy_prices']
+                volumes = data['sell_volumes'] + data['buy_volumes']
             
-            if not prices_to_use:
+            if not prices or not volumes:
                 continue
             
-            # Remove price outliers for more accurate averages
-            filtered_prices = DataProcessor.remove_outliers(prices_to_use)
+            # --- OUTLIER FILTERING (PRICE-ONLY) ---
+            filtered_prices = DataProcessor.remove_outliers(prices)
             
-            total_volume = sum(volumes_to_use)
-            avg_price = sum(filtered_prices) / len(filtered_prices) if filtered_prices else 0
+            # Rebuild (price, volume) pairs after filtering
+            filtered_pairs = [
+                (p, v) for p, v in zip(prices, volumes)
+                if p in filtered_prices
+            ]
+            
+            if not filtered_pairs:
+                continue
+            
+            filtered_volume = sum(v for _, v in filtered_pairs)
+            if filtered_volume <= 0:
+                continue
+            
+            # --- VOLUME-WEIGHTED AVERAGE PRICE ---
+            avg_price = sum(p * v for p, v in filtered_pairs) / filtered_volume
+            
+            total_volume = sum(volumes)
             value_score = total_volume * avg_price
             
             result[item_id] = {
@@ -415,12 +426,13 @@ class DataProcessor:
                 'avg_price': avg_price,
                 'value_score': value_score,
                 'sell_orders': len(data['sell_prices']),
-                'buy_orders': len(data['buy_prices']),
-                'sell_details': data['sell_details'],
-                'buy_details': data['buy_details']
+                'buy_orders': len(data['buy_prices'])
             }
         
-        logger_proc.info(f"Aggregated {len(result)} unique items (filter: {order_filter})")
+        logger_proc.info(
+            f"Aggregated {len(result)} unique items "
+            f"(filter: {order_filter}, volume-weighted pricing)"
+        )
         return result
 
 # ============================================================================
