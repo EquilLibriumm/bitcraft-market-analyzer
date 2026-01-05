@@ -118,10 +118,25 @@ class BitjitaClient:
                 items = data
             
             self._item_cache = items
+            logger.info(f"Cached {len(items)} items")
             return items
         except Exception as e:
             logger.error(f"Failed to fetch items: {e}")
             return []
+    
+    def get_categories(self) -> List[str]:
+        """Extract unique categories/tags from items"""
+        items = self.get_all_items()
+        categories = set()
+        
+        for item in items:
+            tag = item.get('tag', '')
+            if tag:
+                categories.add(tag)
+        
+        # Sort and add "All Categories" at top
+        sorted_cats = sorted(list(categories))
+        return ["All Categories"] + sorted_cats
     
     def get_cached_market_data(self, region_name: str) -> Optional[List[Dict]]:
         """Get cached market data if available and recent (within 5 minutes)"""
@@ -144,19 +159,16 @@ class BitjitaClient:
         self._cache_timestamp[cache_key] = time.time()
         logger.info(f"Cached {len(data)} orders for {region_name}")
     
-    def get_market_data(self, region_name: str, item_name: Optional[str] = None, use_cache: bool = True, progress_callback=None) -> List[Dict]:
+    def get_market_data(self, region_name: str, item_name: Optional[str] = None, category: Optional[str] = None, use_cache: bool = True, progress_callback=None) -> List[Dict]:
         """
-        Fetch market listings for a region, optionally filtered by item name
+        Fetch market listings for a region, optionally filtered by item name or category
         Uses cache if available and recent
         progress_callback: optional function to report progress (item_num, total_items)
         """
         # Check cache first
-        if use_cache and not item_name:  # Only use cache for full region scans
+        if use_cache and not item_name and not category:  # Only use cache for full region scans
             cached = self.get_cached_market_data(region_name)
             if cached:
-                if item_name and item_name != "All Items":
-                    # Filter cached data by item name
-                    return [order for order in cached if order.get('name') == item_name]
                 return cached
         
         all_orders = []
@@ -169,7 +181,7 @@ class BitjitaClient:
                 end = region_name.index(")", start)
                 region_num = region_name[start:end].strip()
             
-            logger.info(f"Fetching market data for {region_name} (region {region_num})...")
+            logger.info(f"Fetching market data for {region_name} (region {region_num}), category={category}...")
             
             # Get items
             params = {'hasOrders': 'true'}
@@ -192,7 +204,12 @@ class BitjitaClient:
             
             logger.info(f"Received {len(items)} items with orders")
             
-            # Filter by item name if specified
+            # Filter by category first (most efficient)
+            if category and category != "All Categories":
+                items = [item for item in items if item.get('tag') == category]
+                logger.info(f"Filtered to {len(items)} items in category '{category}'")
+            
+            # Then filter by item name if specified
             if item_name and item_name != "All Items":
                 items = [item for item in items if item.get('name') == item_name]
                 logger.info(f"Filtered to {len(items)} items matching '{item_name}'")
@@ -204,8 +221,7 @@ class BitjitaClient:
             ]
             
             # Process items
-            # Process ALL items but limit display later based on max_results
-            items_to_process = items_with_orders  # Process all items
+            items_to_process = items_with_orders
             
             logger.info(f"Processing {len(items_to_process)} items...")
             
@@ -487,13 +503,14 @@ class WorkerSignals(QObject):
 class MarketDataWorker(QRunnable):
     """Background worker for fetching and processing market data"""
     
-    def __init__(self, client, region: str, min_volume: int, max_results: int, order_filter: str, item_name: str = None):
+    def __init__(self, client, region: str, min_volume: int, max_results: int, order_filter: str, category: str = None, item_name: str = None):
         super().__init__()
         self.client = client
         self.region = region
         self.min_volume = min_volume
         self.max_results = max_results
         self.order_filter = order_filter
+        self.category = category
         self.item_name = item_name
         self.signals = WorkerSignals()
     
@@ -516,6 +533,7 @@ class MarketDataWorker(QRunnable):
             raw_data = self.client.get_market_data(
                 self.region, 
                 self.item_name,
+                self.category,
                 progress_callback=update_fetch_progress
             )
             
@@ -785,15 +803,15 @@ class MarketController:
         self.status_callback = status_callback
         self.thread_pool = QThreadPool()
     
-    def refresh_market_data(self, region: str, min_volume: int, max_results: int, order_filter: str, item_name: str = None):
+    def refresh_market_data(self, region: str, min_volume: int, max_results: int, order_filter: str, category: str = None, item_name: str = None):
         """Trigger background market data refresh"""
-        logger_ctrl.info(f"Refreshing market data for {region}, min_volume={min_volume}, max_results={max_results}, order_filter={order_filter}, item={item_name}")
+        logger_ctrl.info(f"Refreshing market data for {region}, min_volume={min_volume}, max_results={max_results}, order_filter={order_filter}, category={category}, item={item_name}")
         
         # Clear existing data immediately
         self.table_model.update_data([])
         self.status_callback("Loading...")
         
-        worker = MarketDataWorker(self.client, region, min_volume, max_results, order_filter, item_name)
+        worker = MarketDataWorker(self.client, region, min_volume, max_results, order_filter, category, item_name)
         
         logger_ctrl.info("Connecting worker signals...")
         worker.signals.finished.connect(self._on_data_ready)
@@ -894,6 +912,11 @@ class MainWindow(QMainWindow):
         self.order_type_combo.addItems(["Both", "Sell Orders", "Buy Orders"])
         controls_layout1.addWidget(self.order_type_combo)
         
+        controls_layout1.addWidget(QLabel("Category:"))
+        self.category_combo = QComboBox()
+        self.category_combo.addItem("All Categories")
+        controls_layout1.addWidget(self.category_combo)
+        
         controls_layout1.addStretch()
         layout.addLayout(controls_layout1)
         
@@ -959,7 +982,13 @@ class MainWindow(QMainWindow):
         self._load_items()
     
     def _load_items(self):
-        """Load item names for the dropdown"""
+        """Load item names and categories for the dropdowns"""
+        # Load categories
+        categories = self.client.get_categories()
+        for cat in categories[1:]:  # Skip "All Categories" as it's already added
+            self.category_combo.addItem(cat)
+        
+        # Load items
         items = self.client.get_all_items()
         item_names = sorted([item.get('name', '') for item in items if item.get('name')])
         
@@ -969,7 +998,7 @@ class MainWindow(QMainWindow):
         # Update completer
         self.item_combo.completer().setModel(self.item_combo.model())
         
-        self.status_bar.showMessage(f"Loaded {len(item_names)} items")
+        self.status_bar.showMessage(f"Loaded {len(categories)-1} categories and {len(item_names)} items")
     
     def _on_refresh(self):
         """Handle refresh button click"""
@@ -977,6 +1006,7 @@ class MainWindow(QMainWindow):
         min_volume = self.min_volume_spin.value()
         max_results = self.max_results_spin.value()
         item = self.item_combo.currentText()
+        category = self.category_combo.currentText()
         
         # Map order type selection to filter string
         order_type_map = {
@@ -989,11 +1019,14 @@ class MainWindow(QMainWindow):
         if not item or item == "All Items":
             item = None
         
+        if category == "All Categories":
+            category = None
+        
         # Show progress bar
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
-        self.controller.refresh_market_data(region, min_volume, max_results, order_filter, item)
+        self.controller.refresh_market_data(region, min_volume, max_results, order_filter, category, item)
     
     def _on_clear_cache(self):
         """Clear cache and force fresh API scan"""
