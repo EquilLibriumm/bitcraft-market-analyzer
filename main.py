@@ -29,6 +29,19 @@ BITCRAFT_REGIONS = [
     "Region 8 (R8)"
 ]
 
+# Region name to number mapping
+REGION_MAP = {
+    "Region 0 (R0)": "0",
+    "Region 1 (R1)": "1",
+    "Region 2 (R2)": "2",
+    "Region 3 (R3)": "3",
+    "Region 4 (R4)": "4",
+    "Region 5 (R5)": "5",
+    "Region 6 (R6)": "6",
+    "Region 7 (R7)": "7",
+    "Region 8 (R8)": "8"
+}
+
 # ============================================================================
 # utils/logger.py
 # ============================================================================
@@ -67,6 +80,7 @@ class MarketItem:
     volume: int
     region: str
     order_type: str  # 'sell' or 'buy'
+    region_id: int = None  # Numeric region ID (0-8)
 
 # ============================================================================
 # api/bitjita_client.py
@@ -138,6 +152,20 @@ class BitjitaClient:
         sorted_cats = sorted(list(categories))
         return ["All Categories"] + sorted_cats
     
+    def get_tiers(self) -> List[str]:
+        """Extract unique tiers from items"""
+        items = self.get_all_items()
+        tiers = set()
+        
+        for item in items:
+            tier = item.get('tier')
+            if tier is not None:
+                tiers.add(int(tier))
+        
+        # Sort numerically and add "All Tiers" at top
+        sorted_tiers = sorted(list(tiers))
+        return ["All Tiers"] + [f"Tier {t}" for t in sorted_tiers]
+    
     def get_cached_market_data(self, region_name: str) -> Optional[List[Dict]]:
         """Get cached market data if available and recent (within 5 minutes)"""
         import time
@@ -159,14 +187,14 @@ class BitjitaClient:
         self._cache_timestamp[cache_key] = time.time()
         logger.info(f"Cached {len(data)} orders for {region_name}")
     
-    def get_market_data(self, region_name: str, item_name: Optional[str] = None, category: Optional[str] = None, use_cache: bool = True, progress_callback=None) -> List[Dict]:
+    def get_market_data(self, region_name: str, item_name: Optional[str] = None, category: Optional[str] = None, tier: Optional[str] = None, use_cache: bool = True, progress_callback=None) -> List[Dict]:
         """
-        Fetch market listings for a region, optionally filtered by item name or category
+        Fetch market listings for a region, optionally filtered by item name, category, or tier
         Uses cache if available and recent
         progress_callback: optional function to report progress (item_num, total_items)
         """
         # Check cache first
-        if use_cache and not item_name and not category:  # Only use cache for full region scans
+        if use_cache and not item_name and not category and not tier:  # Only use cache for full region scans
             cached = self.get_cached_market_data(region_name)
             if cached:
                 return cached
@@ -181,7 +209,7 @@ class BitjitaClient:
                 end = region_name.index(")", start)
                 region_num = region_name[start:end].strip()
             
-            logger.info(f"Fetching market data for {region_name} (region {region_num}), category={category}...")
+            logger.info(f"Fetching market data for {region_name} (region {region_num}), category={category}, tier={tier}...")
             
             # Get items
             params = {'hasOrders': 'true'}
@@ -204,7 +232,13 @@ class BitjitaClient:
             
             logger.info(f"Received {len(items)} items with orders")
             
-            # Filter by category first (most efficient)
+            # Filter by tier first
+            if tier and tier != "All Tiers":
+                tier_num = int(tier.replace("Tier ", ""))
+                items = [item for item in items if item.get('tier') == tier_num]
+                logger.info(f"Filtered to {len(items)} items in tier {tier_num}")
+            
+            # Filter by category
             if category and category != "All Categories":
                 items = [item for item in items if item.get('tag') == category]
                 logger.info(f"Filtered to {len(items)} items in category '{category}'")
@@ -273,7 +307,8 @@ class BitjitaClient:
                                 'owner': order.get('ownerUsername', 'Unknown'),
                                 'price': price,
                                 'quantity': quantity,
-                                'region_name': order.get('regionName', region_name)
+                                'region_name': order.get('regionName', region_name),
+                                'region_id': order.get('regionId')  # Store the actual region ID
                             }
                             all_orders.append({
                                 'item_id': item_id,
@@ -281,9 +316,11 @@ class BitjitaClient:
                                 'price': price,
                                 'volume': quantity,
                                 'region': order.get('regionName', region_name),
+                                'region_id': order.get('regionId'),  # Add region ID
                                 'order_type': 'sell',
                                 'claim_name': order.get('claimName', 'Unknown'),
-                                'owner': order.get('ownerUsername', 'Unknown')
+                                'owner': order.get('ownerUsername', 'Unknown'),
+                                'tier': item.get('tier')  # Add tier info
                             })
                     
                     # Process buy orders
@@ -302,9 +339,11 @@ class BitjitaClient:
                                 'price': price,
                                 'volume': quantity,
                                 'region': order.get('regionName', region_name),
+                                'region_id': order.get('regionId'),  # Add region ID
                                 'order_type': 'buy',
                                 'claim_name': order.get('claimName', 'Unknown'),
-                                'owner': order.get('ownerUsername', 'Unknown')
+                                'owner': order.get('ownerUsername', 'Unknown'),
+                                'tier': item.get('tier')  # Add tier info
                             })
                     
                     if (idx + 1) % 100 == 0:
@@ -350,40 +389,43 @@ class DataProcessor:
         if len(prices) < 3:
             return prices
         
+        # Sort prices
         sorted_prices = sorted(prices)
         
+        # Calculate percentile indices
         low_idx = int(len(sorted_prices) * (OUTLIER_PERCENTILE_LOW / 100))
         high_idx = int(len(sorted_prices) * (OUTLIER_PERCENTILE_HIGH / 100))
         
+        # Ensure we have at least some data
         if high_idx <= low_idx:
             high_idx = low_idx + 1
         
+        # Return middle range
         filtered = sorted_prices[low_idx:high_idx]
         
         if not filtered:
             return prices[:1] if prices else prices
         
-        logger_proc.debug(
-            f"Filtered {len(prices)} prices to {len(filtered)} "
-            f"(removed {len(prices) - len(filtered)} outliers)"
-        )
+        logger_proc.debug(f"Filtered {len(prices)} prices to {len(filtered)} (removed {len(prices) - len(filtered)} outliers)")
         return filtered
     
     @staticmethod
     def aggregate_items(items: List[MarketItem], order_filter: str = 'both') -> Dict:
         """
-        Group by item_id and calculate metrics with VOLUME-WEIGHTED pricing
+        Group by item_id and calculate metrics with outlier removal
         order_filter: 'both', 'sell', or 'buy'
+        Also stores detailed order information per claim
         """
         aggregated = defaultdict(lambda: {
             'name': '',
             'sell_prices': [],
             'sell_volumes': [],
             'buy_prices': [],
-            'buy_volumes': []
+            'buy_volumes': [],
+            'sell_details': [],  # Store detailed sell orders
+            'buy_details': []    # Store detailed buy orders
         })
         
-        # Collect raw prices + volumes
         for item in items:
             agg = aggregated[item.item_id]
             agg['name'] = item.name
@@ -391,49 +433,35 @@ class DataProcessor:
             if item.order_type == 'sell':
                 agg['sell_prices'].append(item.price)
                 agg['sell_volumes'].append(item.volume)
+                # Store details: we'll get this from raw data
             elif item.order_type == 'buy':
                 agg['buy_prices'].append(item.price)
                 agg['buy_volumes'].append(item.volume)
         
         result = {}
-        
         for item_id, data in aggregated.items():
-            prices = []
-            volumes = []
+            # Filter based on order type
+            prices_to_use = []
+            volumes_to_use = []
             
             if order_filter == 'sell':
-                prices = data['sell_prices']
-                volumes = data['sell_volumes']
+                prices_to_use = data['sell_prices']
+                volumes_to_use = data['sell_volumes']
             elif order_filter == 'buy':
-                prices = data['buy_prices']
-                volumes = data['buy_volumes']
-            else:
-                prices = data['sell_prices'] + data['buy_prices']
-                volumes = data['sell_volumes'] + data['buy_volumes']
+                prices_to_use = data['buy_prices']
+                volumes_to_use = data['buy_volumes']
+            else:  # 'both'
+                prices_to_use = data['sell_prices'] + data['buy_prices']
+                volumes_to_use = data['sell_volumes'] + data['buy_volumes']
             
-            if not prices or not volumes:
+            if not prices_to_use:
                 continue
             
-            # --- OUTLIER FILTERING (PRICE-ONLY) ---
-            filtered_prices = DataProcessor.remove_outliers(prices)
+            # Remove price outliers for more accurate averages
+            filtered_prices = DataProcessor.remove_outliers(prices_to_use)
             
-            # Rebuild (price, volume) pairs after filtering
-            filtered_pairs = [
-                (p, v) for p, v in zip(prices, volumes)
-                if p in filtered_prices
-            ]
-            
-            if not filtered_pairs:
-                continue
-            
-            filtered_volume = sum(v for _, v in filtered_pairs)
-            if filtered_volume <= 0:
-                continue
-            
-            # --- VOLUME-WEIGHTED AVERAGE PRICE ---
-            avg_price = sum(p * v for p, v in filtered_pairs) / filtered_volume
-            
-            total_volume = sum(volumes)
+            total_volume = sum(volumes_to_use)
+            avg_price = sum(filtered_prices) / len(filtered_prices) if filtered_prices else 0
             value_score = total_volume * avg_price
             
             result[item_id] = {
@@ -442,13 +470,12 @@ class DataProcessor:
                 'avg_price': avg_price,
                 'value_score': value_score,
                 'sell_orders': len(data['sell_prices']),
-                'buy_orders': len(data['buy_prices'])
+                'buy_orders': len(data['buy_prices']),
+                'sell_details': data['sell_details'],
+                'buy_details': data['buy_details']
             }
         
-        logger_proc.info(
-            f"Aggregated {len(result)} unique items "
-            f"(filter: {order_filter}, volume-weighted pricing)"
-        )
+        logger_proc.info(f"Aggregated {len(result)} unique items (filter: {order_filter})")
         return result
 
 # ============================================================================
@@ -503,7 +530,7 @@ class WorkerSignals(QObject):
 class MarketDataWorker(QRunnable):
     """Background worker for fetching and processing market data"""
     
-    def __init__(self, client, region: str, min_volume: int, max_results: int, order_filter: str, category: str = None, item_name: str = None):
+    def __init__(self, client, region: str, min_volume: int, max_results: int, order_filter: str, category: str = None, tier: str = None, item_name: str = None):
         super().__init__()
         self.client = client
         self.region = region
@@ -511,6 +538,7 @@ class MarketDataWorker(QRunnable):
         self.max_results = max_results
         self.order_filter = order_filter
         self.category = category
+        self.tier = tier
         self.item_name = item_name
         self.signals = WorkerSignals()
     
@@ -534,6 +562,7 @@ class MarketDataWorker(QRunnable):
                 self.region, 
                 self.item_name,
                 self.category,
+                self.tier,
                 progress_callback=update_fetch_progress
             )
             
@@ -557,12 +586,17 @@ class MarketDataWorker(QRunnable):
                         price=float(entry.get('price', 0)),
                         volume=int(entry.get('volume', 0)),
                         region=entry.get('region', self.region),
-                        order_type=entry.get('order_type', 'sell')
+                        order_type=entry.get('order_type', 'sell'),
+                        region_id=entry.get('region_id')  # Get numeric region ID
                     )
                     if item.price > 0 and item.volume > 0:
                         items.append(item)
                         # Store raw order data for details
                         raw_orders_by_item[item.item_id].append(entry)
+                        
+                        # Log first few items to see region format
+                        if len(items) <= 3:
+                            logger.info(f"MarketItem created: name={item.name}, region='{item.region}', from raw region='{entry.get('region')}'")
                 except (ValueError, KeyError, TypeError) as e:
                     logger.debug(f"Skipping invalid entry: {e}")
                     continue
@@ -593,9 +627,19 @@ class MarketDataWorker(QRunnable):
             for result in all_results:
                 item_id = result['item_id']
                 if item_id in raw_orders_by_item:
-                    result['order_details'] = raw_orders_by_item[item_id]
+                    # Filter order details by order_filter type
+                    all_details = raw_orders_by_item[item_id]
+                    if self.order_filter == 'sell':
+                        result['order_details'] = [d for d in all_details if d.get('order_type') == 'sell']
+                    elif self.order_filter == 'buy':
+                        result['order_details'] = [d for d in all_details if d.get('order_type') == 'buy']
+                    else:
+                        result['order_details'] = all_details
+                    
+                    logger.info(f"Item {result['name']}: {len(result['order_details'])} order details (filter: {self.order_filter})")
                 else:
                     result['order_details'] = []
+                    logger.warning(f"Item {result['name']}: No order details found!")
             
             if not all_results:
                 self.signals.progress_percent.emit(0)
@@ -629,7 +673,7 @@ from typing import List, Dict, Any
 class MarketTableModel(QAbstractTableModel):
     """Table model for displaying market analysis results with expandable details"""
     
-    HEADERS = ['Item Name', 'Total Volume', 'Average Price', 'Value Score', 'Sell Orders', 'Buy Orders']
+    HEADERS = ['Item Name', 'Total Volume', 'Average Price', 'Value Score', 'Sell Orders', 'Buy Orders', 'Regions']
     
     def __init__(self):
         super().__init__()
@@ -675,7 +719,9 @@ class MarketTableModel(QAbstractTableModel):
         try:
             item_idx, detail_idx, item = self._get_actual_item_and_detail(row)
             
-            if item_idx is None:
+            if item_idx is None or item is None:
+                logger = setup_logger('table_model')
+                logger.warning(f"Could not map row {row} to item")
                 return None
             
             if role == Qt.DisplayRole:
@@ -694,26 +740,45 @@ class MarketTableModel(QAbstractTableModel):
                         return str(item.get('sell_orders', 0))
                     elif col == 5:
                         return str(item.get('buy_orders', 0))
+                    elif col == 6:
+                        regions = item.get('regions', [])
+                        if regions:
+                            return ", ".join(regions)
+                        return ""
                 # Detail row
                 else:
                     details = item.get('order_details', [])
-                    if detail_idx < len(details):
-                        order = details[detail_idx]
-                        if col == 0:
-                            claim = order.get('claim_name', 'Unknown')
-                            owner = order.get('owner', 'Unknown')
-                            order_type = order.get('order_type', 'sell').upper()
-                            return f"    [{order_type}] {claim} ({owner})"
-                        elif col == 1:
-                            return f"{order.get('volume', 0):,}"
-                        elif col == 2:
-                            return f"${order.get('price', 0):.2f}"
-                        elif col == 3:
-                            vol = order.get('volume', 0)
-                            price = order.get('price', 0)
-                            return f"${vol * price:,.2f}"
-                        elif col == 4 or col == 5:
-                            return ""
+                    if detail_idx >= len(details):
+                        logger = setup_logger('table_model')
+                        logger.warning(f"detail_idx {detail_idx} out of range for {len(details)} details")
+                        return None
+                    
+                    order = details[detail_idx]
+                    if col == 0:
+                        claim = order.get('claim_name', 'Unknown')
+                        owner = order.get('owner', 'Unknown')
+                        order_type = order.get('order_type', 'sell').upper()
+                        tier = order.get('tier')
+                        tier_str = f" [T{tier}]" if tier is not None else ""
+                        return f"    [{order_type}]{tier_str} {claim} ({owner})"
+                    elif col == 1:
+                        return f"{order.get('volume', 0):,}"
+                    elif col == 2:
+                        return f"${order.get('price', 0):.2f}"
+                    elif col == 3:
+                        vol = order.get('volume', 0)
+                        price = order.get('price', 0)
+                        return f"${vol * price:,.2f}"
+                    elif col == 4:
+                        return ""
+                    elif col == 5:
+                        return ""
+                    elif col == 6:
+                        # Show region for this specific order using region_id
+                        region_id = order.get('region_id')
+                        if region_id is not None:
+                            return f"R{region_id}"
+                        return ""
             
             elif role == Qt.FontRole:
                 if detail_idx >= 0:
@@ -755,16 +820,24 @@ class MarketTableModel(QAbstractTableModel):
         """Toggle expansion of a row"""
         item_idx, detail_idx, item = self._get_actual_item_and_detail(row)
         
+        logger = setup_logger('table_model')
+        logger.info(f"Toggle expand called for row {row}, item_idx={item_idx}, detail_idx={detail_idx}")
+        
         # Only toggle if clicking on main row
         if item_idx is not None and detail_idx == -1:
+            logger.info(f"Item has {len(item.get('order_details', []))} order details")
+            
             if item_idx in self._expanded_rows:
                 self._expanded_rows.remove(item_idx)
+                logger.info(f"Collapsed item {item_idx}")
             else:
                 self._expanded_rows.add(item_idx)
+                logger.info(f"Expanded item {item_idx}")
             
             # Refresh the view
             self.beginResetModel()
             self.endResetModel()
+            logger.info(f"Table reset, new rowCount={self.rowCount()}")
     
     def sort(self, column: int, order: Qt.SortOrder):
         """Sort table by column"""
@@ -776,7 +849,8 @@ class MarketTableModel(QAbstractTableModel):
             2: 'avg_price',
             3: 'value_score',
             4: 'sell_orders',
-            5: 'buy_orders'
+            5: 'buy_orders',
+            6: lambda x: len(x.get('regions', []))  # Sort by number of regions
         }
         
         key = key_map.get(column, 'value_score')
@@ -803,15 +877,15 @@ class MarketController:
         self.status_callback = status_callback
         self.thread_pool = QThreadPool()
     
-    def refresh_market_data(self, region: str, min_volume: int, max_results: int, order_filter: str, category: str = None, item_name: str = None):
+    def refresh_market_data(self, region: str, min_volume: int, max_results: int, order_filter: str, category: str = None, tier: str = None, item_name: str = None):
         """Trigger background market data refresh"""
-        logger_ctrl.info(f"Refreshing market data for {region}, min_volume={min_volume}, max_results={max_results}, order_filter={order_filter}, category={category}, item={item_name}")
+        logger_ctrl.info(f"Refreshing market data for {region}, min_volume={min_volume}, max_results={max_results}, order_filter={order_filter}, category={category}, tier={tier}, item={item_name}")
         
         # Clear existing data immediately
         self.table_model.update_data([])
         self.status_callback("Loading...")
         
-        worker = MarketDataWorker(self.client, region, min_volume, max_results, order_filter, category, item_name)
+        worker = MarketDataWorker(self.client, region, min_volume, max_results, order_filter, category, tier, item_name)
         
         logger_ctrl.info("Connecting worker signals...")
         worker.signals.finished.connect(self._on_data_ready)
@@ -858,9 +932,10 @@ class MarketController:
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QComboBox, QSpinBox, QTableView,
-    QLabel, QStatusBar, QCompleter, QProgressBar
+    QLabel, QStatusBar, QCompleter, QProgressBar, QFrame
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPalette, QColor, QFont
 
 class MainWindow(QMainWindow):
     """Main application window"""
@@ -872,121 +947,335 @@ class MainWindow(QMainWindow):
         self.client = client
         
         self.setWindowTitle("BitCraft Market Analyzer")
-        self.setMinimumSize(1000, 600)
+        self.setMinimumSize(1200, 700)
         
+        self._apply_dark_theme()
         self._setup_ui(regions)
+    
+    def _apply_dark_theme(self):
+        """Apply modern dark theme with green accents"""
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1a1a1a;
+            }
+            QWidget {
+                background-color: #1a1a1a;
+                color: #e0e0e0;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 10pt;
+                padding: 5%;
+                border-radius: 6px;
+            }
+            QLabel {
+                color: #b0b0b0;
+                font-weight: 500;
+            }
+            QComboBox, QSpinBox {
+                background-color: #2a2a2a;
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+                padding: 6px 10px;
+                color: #e0e0e0;
+                min-height: 24px;
+            }
+            QComboBox:hover, QSpinBox:hover {
+                border: 1px solid #4CAF50;
+                background-color: #2d2d2d;
+            }
+            QComboBox:focus, QSpinBox:focus {
+                border: 1px solid #66BB6A;
+            }
+            QComboBox::drop-down {
+                border: none;
+                padding-right: 8px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2a2a2a;
+                border: 1px solid #3a3a3a;
+                selection-background-color: #4CAF50;
+                selection-color: #ffffff;
+                color: #e0e0e0;
+                padding: 4px;
+            }
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 20px;
+                font-weight: 600;
+                min-height: 32px;
+            }
+            QPushButton:hover {
+                background-color: #66BB6A;
+            }
+            QPushButton:pressed {
+                background-color: #388E3C;
+            }
+            QPushButton:disabled {
+                background-color: #3a3a3a;
+                color: #666666;
+            }
+            QPushButton#clearCacheBtn {
+                background-color: #455A64;
+            }
+            QPushButton#clearCacheBtn:hover {
+                background-color: #546E7A;
+            }
+            QTableView {
+                background-color: #242424;
+                alternate-background-color: #2a2a2a;
+                border: 1px solid #3a3a3a;
+                border-radius: 8px;
+                gridline-color: #333333;
+                selection-background-color: #4CAF50;
+                selection-color: white;
+            }
+            QTableView::item {
+                padding: 8px;
+                border: none;
+            }
+            QTableView::item:hover {
+                background-color: #2d2d2d;
+            }
+            QTableView::item:selected {
+                background-color: #4CAF50;
+            }
+            QHeaderView::section {
+                background-color: #2d2d2d;
+                color: #b0b0b0;
+                padding: 10px;
+                border: none;
+                border-bottom: 2px solid #4CAF50;
+                font-weight: 600;
+                text-transform: uppercase;
+                font-size: 9pt;
+                letter-spacing: 0.5px;
+            }
+            QHeaderView::section:hover {
+                background-color: #333333;
+            }
+            QProgressBar {
+                border: 1px solid #3a3a3a;
+                border-radius: 6px;
+                background-color: #242424;
+                text-align: center;
+                color: #e0e0e0;
+                height: 24px;
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4CAF50, stop:1 #66BB6A);
+                border-radius: 5px;
+            }
+            QStatusBar {
+                background-color: #1f1f1f;
+                color: #b0b0b0;
+                border-top: 1px solid #3a3a3a;
+            }
+            QFrame#controlPanel {
+                background-color: #242424;
+                border-radius: 8px;
+                padding: 12px;
+                border: 1px solid #3a3a3a;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #3a3a3a;
+                border: none;
+                width: 16px;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #4CAF50;
+            }
+            QScrollBar:vertical {
+                background-color: #242424;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #4a4a4a;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #4CAF50;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
     
     def _setup_ui(self, regions: List[str]):
         """Set up the user interface"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        layout = QVBoxLayout(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(16, 16, 16, 16)
         
-        # Top controls - Row 1
+        # Title
+        title_label = QLabel("🎮 BitCraft Market Analyzer")
+        title_font = QFont()
+        title_font.setPointSize(16)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        title_label.setStyleSheet("color: #4CAF50; margin-bottom: 8px;")
+        main_layout.addWidget(title_label)
+        
+        # Control panel frame
+        control_frame = QFrame()
+        control_frame.setObjectName("controlPanel")
+        control_layout = QVBoxLayout(control_frame)
+        control_layout.setSpacing(12)
+        
+        # Row 1: Main filters
         controls_layout1 = QHBoxLayout()
+        controls_layout1.setSpacing(12)
         
-        controls_layout1.addWidget(QLabel("Region:"))
+        controls_layout1.addWidget(QLabel("🗺️ Region:"))
         self.region_combo = QComboBox()
         self.region_combo.addItems(regions)
+        self.region_combo.setMinimumWidth(160)
         controls_layout1.addWidget(self.region_combo)
         
-        controls_layout1.addWidget(QLabel("Min Volume:"))
+        controls_layout1.addWidget(QLabel("📊 Min Volume:"))
         self.min_volume_spin = QSpinBox()
         self.min_volume_spin.setMinimum(0)
         self.min_volume_spin.setMaximum(100000)
         self.min_volume_spin.setValue(DEFAULT_MIN_VOLUME)
         self.min_volume_spin.setSingleStep(10)
+        self.min_volume_spin.setMinimumWidth(100)
         controls_layout1.addWidget(self.min_volume_spin)
         
-        controls_layout1.addWidget(QLabel("Max Results:"))
+        controls_layout1.addWidget(QLabel("📈 Max Results:"))
         self.max_results_spin = QSpinBox()
         self.max_results_spin.setMinimum(10)
-        self.max_results_spin.setMaximum(2000)
+        self.max_results_spin.setMaximum(10000)
         self.max_results_spin.setValue(DEFAULT_MAX_RESULTS)
         self.max_results_spin.setSingleStep(50)
+        self.max_results_spin.setMinimumWidth(100)
         controls_layout1.addWidget(self.max_results_spin)
         
-        controls_layout1.addWidget(QLabel("Order Type:"))
+        controls_layout1.addWidget(QLabel("💰 Order Type:"))
         self.order_type_combo = QComboBox()
         self.order_type_combo.addItems(["Both", "Sell Orders", "Buy Orders"])
+        self.order_type_combo.setMinimumWidth(140)
         controls_layout1.addWidget(self.order_type_combo)
         
-        controls_layout1.addWidget(QLabel("Category:"))
-        self.category_combo = QComboBox()
-        self.category_combo.addItem("All Categories")
-        controls_layout1.addWidget(self.category_combo)
-        
         controls_layout1.addStretch()
-        layout.addLayout(controls_layout1)
+        control_layout.addLayout(controls_layout1)
         
-        # Top controls - Row 2: Item search
+        # Row 2: Item filters
         controls_layout2 = QHBoxLayout()
+        controls_layout2.setSpacing(12)
         
-        controls_layout2.addWidget(QLabel("Item:"))
+        controls_layout2.addWidget(QLabel("🏷️ Category:"))
+        self.category_combo = QComboBox()
+        self.category_combo.setEditable(True)
+        self.category_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.category_combo.addItem("All Categories")
+        self.category_combo.setMinimumWidth(160)
+        
+        category_completer = QCompleter()
+        category_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        category_completer.setFilterMode(Qt.MatchContains)
+        self.category_combo.setCompleter(category_completer)
+        controls_layout2.addWidget(self.category_combo)
+        
+        controls_layout2.addWidget(QLabel("⭐ Tier:"))
+        self.tier_combo = QComboBox()
+        self.tier_combo.addItem("All Tiers")
+        self.tier_combo.setMinimumWidth(100)
+        controls_layout2.addWidget(self.tier_combo)
+        
+        controls_layout2.addWidget(QLabel("🔍 Item:"))
         self.item_combo = QComboBox()
         self.item_combo.setEditable(True)
         self.item_combo.setInsertPolicy(QComboBox.NoInsert)
         self.item_combo.addItem("All Items")
-        self.item_combo.setMinimumWidth(300)
+        self.item_combo.setMinimumWidth(240)
         
-        # Add completer for autocomplete
         completer = QCompleter()
         completer.setCaseSensitivity(Qt.CaseInsensitive)
         completer.setFilterMode(Qt.MatchContains)
         self.item_combo.setCompleter(completer)
-        
         controls_layout2.addWidget(self.item_combo)
         
-        self.refresh_btn = QPushButton("Refresh Market Data")
-        self.refresh_btn.clicked.connect(self._on_refresh)
-        controls_layout2.addWidget(self.refresh_btn)
-        
-        self.clear_cache_btn = QPushButton("Clear Cache & Rescan")
-        self.clear_cache_btn.clicked.connect(self._on_clear_cache)
-        controls_layout2.addWidget(self.clear_cache_btn)
-        
         controls_layout2.addStretch()
-        layout.addLayout(controls_layout2)
+        control_layout.addLayout(controls_layout2)
         
-        # Table view
+        # Row 3: Action buttons
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(12)
+        
+        self.refresh_btn = QPushButton("🔄 Refresh Market Data")
+        self.refresh_btn.clicked.connect(self._on_refresh)
+        self.refresh_btn.setMinimumWidth(200)
+        button_layout.addWidget(self.refresh_btn)
+        
+        self.clear_cache_btn = QPushButton("🗑️ Clear Cache")
+        self.clear_cache_btn.setObjectName("clearCacheBtn")
+        self.clear_cache_btn.clicked.connect(self._on_clear_cache)
+        self.clear_cache_btn.setMinimumWidth(140)
+        button_layout.addWidget(self.clear_cache_btn)
+        
+        button_layout.addStretch()
+        control_layout.addLayout(button_layout)
+        
+        main_layout.addWidget(control_frame)
+        
+        # Table view with better styling
         self.table_view = QTableView()
         self.table_view.setModel(self.table_model)
-        self.table_view.setSortingEnabled(False)  # Disable sorting with expandable rows
+        self.table_view.setSortingEnabled(False)
         self.table_view.setAlternatingRowColors(True)
         self.table_view.horizontalHeader().setStretchLastSection(True)
+        self.table_view.setSelectionBehavior(QTableView.SelectRows)
+        self.table_view.setSelectionMode(QTableView.SingleSelection)
         self.table_view.clicked.connect(self._on_table_click)
+        self.table_view.setShowGrid(False)
+        self.table_view.verticalHeader().setVisible(False)
         
         # Set column widths
-        self.table_view.setColumnWidth(0, 250)
-        self.table_view.setColumnWidth(1, 120)
-        self.table_view.setColumnWidth(2, 120)
+        self.table_view.setColumnWidth(0, 280)
+        self.table_view.setColumnWidth(1, 130)
+        self.table_view.setColumnWidth(2, 130)
         self.table_view.setColumnWidth(3, 150)
-        self.table_view.setColumnWidth(4, 100)
-        self.table_view.setColumnWidth(5, 100)
+        self.table_view.setColumnWidth(4, 110)
+        self.table_view.setColumnWidth(5, 110)
+        self.table_view.setColumnWidth(6, 130)
         
-        layout.addWidget(self.table_view)
+        main_layout.addWidget(self.table_view)
         
         # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setTextVisible(True)
-        layout.addWidget(self.progress_bar)
+        main_layout.addWidget(self.progress_bar)
         
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready")
+        self.status_bar.showMessage("✨ Ready to analyze market data")
         
         # Load items after UI is set up
         self._load_items()
     
     def _load_items(self):
-        """Load item names and categories for the dropdowns"""
+        """Load item names, categories, and tiers for the dropdowns"""
         # Load categories
         categories = self.client.get_categories()
         for cat in categories[1:]:  # Skip "All Categories" as it's already added
             self.category_combo.addItem(cat)
+        
+        # Update category completer
+        self.category_combo.completer().setModel(self.category_combo.model())
+        
+        # Load tiers
+        tiers = self.client.get_tiers()
+        for tier in tiers[1:]:  # Skip "All Tiers" as it's already added
+            self.tier_combo.addItem(tier)
         
         # Load items
         items = self.client.get_all_items()
@@ -995,10 +1284,10 @@ class MainWindow(QMainWindow):
         for name in item_names:
             self.item_combo.addItem(name)
         
-        # Update completer
+        # Update item completer
         self.item_combo.completer().setModel(self.item_combo.model())
         
-        self.status_bar.showMessage(f"Loaded {len(categories)-1} categories and {len(item_names)} items")
+        self.status_bar.showMessage(f"✅ Loaded {len(categories)-1} categories, {len(tiers)-1} tiers, and {len(item_names)} items")
     
     def _on_refresh(self):
         """Handle refresh button click"""
@@ -1007,6 +1296,7 @@ class MainWindow(QMainWindow):
         max_results = self.max_results_spin.value()
         item = self.item_combo.currentText()
         category = self.category_combo.currentText()
+        tier = self.tier_combo.currentText()
         
         # Map order type selection to filter string
         order_type_map = {
@@ -1022,11 +1312,14 @@ class MainWindow(QMainWindow):
         if category == "All Categories":
             category = None
         
+        if tier == "All Tiers":
+            tier = None
+        
         # Show progress bar
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
-        self.controller.refresh_market_data(region, min_volume, max_results, order_filter, category, item)
+        self.controller.refresh_market_data(region, min_volume, max_results, order_filter, category, tier, item)
     
     def _on_clear_cache(self):
         """Clear cache and force fresh API scan"""
